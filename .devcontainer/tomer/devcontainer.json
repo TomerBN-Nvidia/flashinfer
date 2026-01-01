@@ -1,0 +1,36 @@
+{
+    "name": "flashinfer",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "devuser",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                // Python development
+                "ms-python.python",
+                "charliermarsh.ruff",
+                // Rust development
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "pinage404.git-extension-pack"
+            ]
+        }
+    },
+    "forwardPorts": [],
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
+    // The two lines below ensures that your local changes in the sglang
+    // repo is automatically synced to the sglang pip package installed
+    // in the dev docker container. You can remove / comment out these
+    // two lines if you prefer to sync code changes manually.
+    "workspaceMount": "source=${localWorkspaceFolder},target=/flashinfer-workspace/flashinfer,type=bind",
+    "workspaceFolder": "/flashinfer-workspace/flashinfer",
+    "mounts": [
+        "source=/home/scratch.tbarnatan_gpu/models,target=/models,type=bind",
+        "source=/home/scratch.tbarnatan_gpu/data,target=/data,type=bind",
+        "source=/home/scratch.roik_gpu/super_v3/output-roik,target=/home/scratch.roik_gpu/super_v3/output-roik,type=bind"
+    ]
+}
