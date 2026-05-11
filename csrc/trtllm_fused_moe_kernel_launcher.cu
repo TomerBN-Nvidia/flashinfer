@@ -29,6 +29,7 @@
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
+#include "nan_check.h"
 #include "nv_internal/tensorrt_llm/kernels/quantization.h"
 #include "nv_internal/tensorrt_llm/thop/utils.h"
 #include "tvm_ffi_utils.h"
@@ -1932,10 +1933,27 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     TVM_FFI_ICHECK(replay.device().device_id == hidden_states.device().device_id)
         << "routing_replay_out must be on the same device as hidden_states";
     TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
-    // routing_replay_out dim0 check removed: buffer may be larger than num_tokens
     TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
     TVM_FFI_ICHECK(encode_dlpack_dtype(replay.dtype()) == int16_code)
         << "routing_replay_out must be int16 dtype";
+  }
+
+  {
+    auto stream = get_stream(hidden_states.device());
+    flashinfer::nan_check::LaunchNanCheckFp8Bytes(
+        hidden_states.data_ptr(), hidden_states.numel(),
+        "trtllm_fp8_block_scale_moe:hidden_states[fp8]", stream);
+    if (quantization_type == Fp8QuantizationType::MxFp8) {
+      flashinfer::nan_check::LaunchNanCheckE8M0Scales(
+          hidden_states_scale.data_ptr(), hidden_states_scale.numel(),
+          "trtllm_fp8_block_scale_moe:hidden_states_scale[e8m0]", stream);
+      flashinfer::nan_check::LaunchNanCheckE8M0Scales(
+          gemm1_weights_scale.data_ptr(), gemm1_weights_scale.numel(),
+          "trtllm_fp8_block_scale_moe:gemm1_weights_scale[e8m0]", stream);
+      flashinfer::nan_check::LaunchNanCheckE8M0Scales(
+          gemm2_weights_scale.data_ptr(), gemm2_weights_scale.numel(),
+          "trtllm_fp8_block_scale_moe:gemm2_weights_scale[e8m0]", stream);
+    }
   }
 
   auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
@@ -1988,9 +2006,25 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  return selected_launcher->run(
+  auto result = selected_launcher->run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
       quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */);
+
+  {
+    auto stream = get_stream(hidden_states.device());
+    auto out_dtype = output.dtype();
+    if (out_dtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(output.data_ptr(), output.numel(),
+                                                    "trtllm_fp8_block_scale_moe:output[bf16]",
+                                                    stream);
+    } else if (out_dtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(output.data_ptr(), output.numel(),
+                                                "trtllm_fp8_block_scale_moe:output[fp16]",
+                                                stream);
+    }
+  }
+
+  return result;
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(

@@ -25,6 +25,7 @@
 #include <tvm/ffi/extra/module.h>
 
 #include "../../tvm_ffi_utils.h"
+#include "../../nan_check.h"
 #include "cutlass_kernel_selector.h"
 #include "moe_gemm_kernels.h"
 #include "tensorrt_llm/common/workspace.h"
@@ -371,6 +372,23 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto stream = get_stream(input.device());
 
+    // NaN checks on fused MoE inputs
+    if (mActivationDtype == dl_float8_e4m3fn) {
+      flashinfer::nan_check::LaunchNanCheckFp8Bytes(input.data_ptr(), input.numel(),
+                                                    "cutlass_fused_moe:input[fp8]", stream);
+    } else if (mActivationDtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(input.data_ptr(), input.numel(),
+                                                    "cutlass_fused_moe:input[bf16]", stream);
+    } else if (mActivationDtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(input.data_ptr(), input.numel(),
+                                                "cutlass_fused_moe:input[fp16]", stream);
+    }
+    if (input_sf.has_value()) {
+      flashinfer::nan_check::LaunchNanCheckE8M0Scales(
+          input_sf.value().data_ptr(), input_sf.value().numel(),
+          "cutlass_fused_moe:input_sf[e8m0]", stream);
+    }
+
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
@@ -420,6 +438,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode, min_latency_params,
         enable_pdl, stream);
 #endif
+
+    // NaN checks on fused MoE output
+    if (mOutputDtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(output.data_ptr(), output.numel(),
+                                                    "cutlass_fused_moe:output[bf16]", stream);
+    } else if (mOutputDtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(output.data_ptr(), output.numel(),
+                                                "cutlass_fused_moe:output[fp16]", stream);
+    }
   }
 
   void runMoeMinLantency(TensorView output, TensorView input, TensorView token_selected_experts,
@@ -538,6 +565,23 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto stream = get_stream(input.device());
 
+    // NaN checks on fused MoE min-latency inputs
+    if (mActivationDtype == dl_float8_e4m3fn) {
+      flashinfer::nan_check::LaunchNanCheckFp8Bytes(
+          input.data_ptr(), input.numel(), "cutlass_fused_moe_ml:input[fp8]", stream);
+    } else if (mActivationDtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(input.data_ptr(), input.numel(),
+                                                    "cutlass_fused_moe_ml:input[bf16]", stream);
+    } else if (mActivationDtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(input.data_ptr(), input.numel(),
+                                                "cutlass_fused_moe_ml:input[fp16]", stream);
+    }
+    if (input_sf.has_value()) {
+      flashinfer::nan_check::LaunchNanCheckE8M0Scales(
+          input_sf.value().data_ptr(), input_sf.value().numel(),
+          "cutlass_fused_moe_ml:input_sf[e8m0]", stream);
+    }
+
     CHECK_DIM(1, num_active_experts_per_node);
     CHECK_INPUT_TYPE(num_active_experts_per_node, dl_int32);
     TVM_FFI_ICHECK_EQ(num_active_experts_per_node.size(0), 1);
@@ -607,6 +651,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
         min_latency_params, enable_pdl, stream);
 #endif
+
+    // NaN checks on fused MoE min-latency output
+    if (mOutputDtype == dl_bfloat16) {
+      flashinfer::nan_check::LaunchNanCheckBFloat16(output.data_ptr(), output.numel(),
+                                                    "cutlass_fused_moe_ml:output[bf16]", stream);
+    } else if (mOutputDtype == dl_float16) {
+      flashinfer::nan_check::LaunchNanCheckHalf(output.data_ptr(), output.numel(),
+                                                "cutlass_fused_moe_ml:output[fp16]", stream);
+    }
   }
 
   int64_t getTacticNum() {
