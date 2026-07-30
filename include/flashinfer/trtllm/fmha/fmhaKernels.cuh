@@ -137,14 +137,31 @@ class TllmGenFmhaKernel {
         if (mKernelMetaMap.find(hash) != mKernelMetaMap.end()) {
           // The kernelMeta of the existing kernel.
           auto const& existingKernelMeta = mKernelMeta[mKernelMetaMap.at(hash)];
-          // Allow conflicts only if they are family/specific versions of the same architecture.
-          FLASHINFER_CHECK(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
-                           "Hash conflicts exist between %s and %s.", existingKernelMeta.mFuncName,
-                           kernelMeta.mFuncName);
-
-          // Prefer specific SM version over family version (replace if existing is family).
-          if (existingKernelMeta.mSM == kSM_100f) {
-            mKernelMetaMap[hash] = i;
+          if (isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM)) {
+            // Family/specific versions of the same architecture: prefer the specific SM version
+            // over the family version (replace if existing is family).
+            if (existingKernelMeta.mSM == kSM_100f) {
+              mKernelMetaMap[hash] = i;
+            }
+          } else {
+            // The full trtllm-gen export may ship multiple step-tiling variants of the same
+            // kernel (e.g. Q128Kv256 vs Q256Kv128) that differ only in mStepQ/mStepKv — an
+            // implementation detail the selection hash intentionally does not encode. Accept
+            // those and pick one deterministically; any other conflict is a genuine selection
+            // ambiguity and must fail loudly.
+            bool const isStepTilingVariant = existingKernelMeta.mSM == kernelMeta.mSM &&
+                                             (existingKernelMeta.mStepQ != kernelMeta.mStepQ ||
+                                              existingKernelMeta.mStepKv != kernelMeta.mStepKv);
+            FLASHINFER_CHECK(isStepTilingVariant, "Hash conflicts exist between %s and %s.",
+                             existingKernelMeta.mFuncName, kernelMeta.mFuncName);
+            // Prefer the larger mStepQ (then larger mStepKv). This matches the variant that
+            // trtllm-gen also ships as the SM-specific kernel and the tiling used by previous
+            // validated exports.
+            if (kernelMeta.mStepQ > existingKernelMeta.mStepQ ||
+                (kernelMeta.mStepQ == existingKernelMeta.mStepQ &&
+                 kernelMeta.mStepKv > existingKernelMeta.mStepKv)) {
+              mKernelMetaMap[hash] = i;
+            }
           }
         } else {
           mKernelMetaMap[hash] = i;
@@ -159,7 +176,9 @@ class TllmGenFmhaKernel {
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage,
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
-                         int sparseMlaType, bool skipsSoftmax, bool groupsTokensHeadsQ) const {
+                         int sparseMlaType, bool skipsSoftmax, bool groupsTokensHeadsQ,
+                         bool enablesBf16QFp8KvKOnlyTransform, bool separateTransformedKv,
+                         bool fusesDsv4InvRopeFp8Quant) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -193,6 +212,9 @@ class TllmGenFmhaKernel {
     // Bit 57 - 57: skipsSoftmax.
     // Bit 58 - 58: dynamicNumTokensPerPage.
     // Bit 59 - 59: groupsTokensHeadsQ.
+    // Bit 60 - 60: enablesBf16QFp8KvKOnlyTransform.
+    // Bit 61 - 61: separateTransformedKv.
+    // Bit 62 - 62: fusesDsv4InvRopeFp8Quant.
     uint64_t const numTokensPerPageLog2 =
         numTokensPerPage == 0 ? 0 : static_cast<uint64_t>(log2(numTokensPerPage));
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
@@ -208,7 +230,10 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(sparseMlaType) << 55) |
            (static_cast<uint64_t>(skipsSoftmax) << 57) |
            (static_cast<uint64_t>(dynamicNumTokensPerPage) << 58) |
-           (static_cast<uint64_t>(groupsTokensHeadsQ) << 59);
+           (static_cast<uint64_t>(groupsTokensHeadsQ) << 59) |
+           (static_cast<uint64_t>(enablesBf16QFp8KvKOnlyTransform) << 60) |
+           (static_cast<uint64_t>(separateTransformedKv) << 61) |
+           (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 62);
   }
 
   inline bool isDynamicNumTokensPerPageKernel(KernelMeta const& kernelMeta) const {
@@ -223,7 +248,9 @@ class TllmGenFmhaKernel {
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
                   isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
                   kernelMeta.m2CtaMma, kernelMeta.mSparseAttn,
-                  kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsTokensHeadsQ);
+                  kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsTokensHeadsQ,
+                  kernelMeta.mEnablesBf16QFp8KvKOnlyTransform, kernelMeta.mSeparateTransformedKv,
+                  kernelMeta.mFusesDsv4InvRopeFp8Quant);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -952,7 +979,13 @@ class TllmGenFmhaKernel {
                // Kernel selection here never groups tokensQ and headsQ into one CTA, so
                // always look up the dense variant. Grouped kernels are still loaded (and
                // now hash distinctly), they are simply not selected.
-               /* groupsTokensHeadsQ */ false),
+               /* groupsTokensHeadsQ */ false,
+               // The BF16Q-FP8KV transform and DSV4-RoPE-fusion kernel variants are not
+               // selectable through the FlashInfer interface yet; keep their hash bits at 0 so
+               // all currently reachable kernels keep their existing keys.
+               /* enablesBf16QFp8KvKOnlyTransform */ false,
+               /* separateTransformedKv */ false,
+               /* fusesDsv4InvRopeFp8Quant */ false),
         info);
   }
 
