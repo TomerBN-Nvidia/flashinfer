@@ -882,6 +882,8 @@ class TllmGenFmhaKernel {
       } else {
         selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
       }
+      // Keep the traits hashed by the published grouped matrix synchronized with the candidate.
+      syncGqaGenerationTraitsForKernelHash(params, selectKernelParamsCopy);
 
       // Load the kernel.
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
@@ -923,6 +925,7 @@ class TllmGenFmhaKernel {
     } else {
       selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
     }
+    syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
   }
 
   // Selects a heuristic kernel for GQA generation.
@@ -960,6 +963,8 @@ class TllmGenFmhaKernel {
       tileSizeQ = 128;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     }
+
+    syncGqaGenerationTraitsForKernelHash(params, selectKernelParams);
 
     // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
     // groups both tokensQ and headsQ into one CTA.
